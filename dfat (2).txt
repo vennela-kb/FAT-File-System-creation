@@ -1,0 +1,260 @@
+import sys
+import os
+import Disk  
+
+ROOT_DIR_BLOCK = 2  
+ENTRY_SIZE = 32  
+FILE_TYPE = 0x0003  # Based on dFAT_data_structures.cpp
+DIR_TYPE = 0x0002   # Based on dFAT_data_structures.cpp
+UNUSED_ENTRY = 0x0000
+
+class FilesystemBrowser:
+    def __init__(self, disk_file, block_size=512):
+       
+        self.disk = Disk.Disk(disk_file, block_size)
+        self.block_size = block_size
+        self.current_dir_block = ROOT_DIR_BLOCK
+        self.path = ["/"]  
+        
+        
+        self.disk_label = "DiskImage_for_CSC712_Assignment04"  
+    
+    def get_current_path(self):
+        """Return the current path as a string"""
+        if len(self.path) == 1:
+            return "/"
+        return "/".join(self.path)
+    
+    def parse_directory_entries(self, block_num):
+        """Parse directory entries from a block"""
+        entries = []
+        block_data = self.disk.readBlock(block_num)
+        
+        
+        max_entries = self.block_size // ENTRY_SIZE
+        
+        for i in range(max_entries):
+            offset = i * ENTRY_SIZE
+            
+            # According to dFAT_data_structures.cpp:
+            # struct dir_listing {
+            #     unsigned short type;        // 2 bytes
+            #     unsigned short block;       // 2 bytes
+            #     unsigned int metadata;      // 4 bytes (file size)
+            #     char name[24];              // 24 bytes
+            # };
+            
+            # Read entry type (2 bytes)
+            entry_type = int.from_bytes(block_data[offset:offset+2], byteorder='little')
+            
+            # Skip unused entries, but be more lenient about what we consider valid
+            if entry_type == UNUSED_ENTRY:
+                # Check if there might be a valid name - could be a hidden file
+                name_bytes = block_data[offset+8:offset+32]
+                if not any(name_bytes):  # If all bytes are zero, definitely unused
+                    continue
+            
+            # Read block number (2 bytes)
+            start_block = int.from_bytes(block_data[offset+2:offset+4], byteorder='little')
+            
+            # Read metadata/size (4 bytes)
+            size = int.from_bytes(block_data[offset+4:offset+8], byteorder='little')
+            
+            # Read name (24 bytes)
+            try:
+                name = block_data[offset+8:offset+32].decode('utf-8', errors='replace').strip('\x00')
+                # Skip entries with empty names
+                if not name:
+                    continue
+            except:
+                # If decoding fails, use a placeholder name
+                name = f"[Unreadable-{i}]"
+            
+            # Determine type - be more accepting of various type values
+            if entry_type == DIR_TYPE:
+                entry_type_str = 'directory'
+            else:
+                # Consider anything that's not explicitly a directory to be a file
+                entry_type_str = 'file'
+            
+            entries.append({
+                'type': entry_type_str,
+                'name': name,
+                'size': size,
+                'start_block': start_block,
+                'raw_type': entry_type  # Save raw type for debugging
+            })
+        
+        return entries
+    
+    def list_directory(self):
+        """List contents of current directory"""
+        try:
+            entries = self.parse_directory_entries(self.current_dir_block)
+            
+            print(f"\nContents of {self.get_current_path()}:")
+            print(f"{'Type':<10} {'Size':<10} {'Name'}")
+            print("-" * 40)
+            
+            for entry in entries:
+                entry_type = entry['type']
+                # Format type with square brackets
+                type_display = "[DIR]" if entry_type == 'directory' else "[FILE]"
+                
+                # Format size - only show for files
+                size = f"{entry['size']}" if entry_type == 'file' else ""
+                
+                name = entry['name']
+                print(f"{type_display:<10} {size:>9} {name}")
+        except Exception as e:
+            print(f"Error reading directory: {str(e)}")
+    
+    def change_directory(self, dir_name):
+        """Change to specified directory"""
+        if dir_name == "..":
+            # Move to parent directory
+            if len(self.path) > 1:
+                # Look for parent directory's block number
+                parent_entries = self.parse_directory_entries(self.current_dir_block)
+                for entry in parent_entries:
+                    if entry['name'] == "..":
+                        self.current_dir_block = entry['start_block']
+                        self.path.pop()
+                        return
+                # If .. entry not found, default to root
+                self.current_dir_block = ROOT_DIR_BLOCK
+                self.path = ["/"]
+        else:
+            # Find the named directory
+            entries = self.parse_directory_entries(self.current_dir_block)
+            for entry in entries:
+                if entry['name'] == dir_name and entry['type'] == 'directory':
+                    self.current_dir_block = entry['start_block']
+                    self.path.append(dir_name)
+                    return
+            print(f"Directory '{dir_name}' not found")
+    
+    def read_file(self, file_name):
+        """Read and display a file's contents"""
+        entries = self.parse_directory_entries(self.current_dir_block)
+        
+        # First pass: look for exact match
+        for entry in entries:
+            if entry['name'] == file_name and entry['type'] == 'file':
+                self._display_file_content(entry)
+                return
+        
+        # Second pass: case-insensitive search
+        for entry in entries:
+            if entry['name'].lower() == file_name.lower() and entry['type'] == 'file':
+                self._display_file_content(entry)
+                return
+                
+        # Third pass: check all entries regardless of type
+        for entry in entries:
+            if entry['name'] == file_name:
+                # If it's marked as directory but user tries to read it as file
+                if entry['type'] == 'directory':
+                    print(f"'{file_name}' is a directory, not a file.")
+                else:
+                    self._display_file_content(entry)
+                return
+        
+        print(f"File '{file_name}' not found")
+    
+    def _display_file_content(self, entry):
+        """Helper method to display file content"""
+        size = entry['size']
+        start_block = entry['start_block']
+        
+        # Calculate how many blocks we need to read
+        blocks_needed = (size + self.block_size - 1) // self.block_size
+        content = b''
+        
+        for i in range(blocks_needed):
+            block_data = self.disk.readBlock(start_block + i)
+            content += block_data
+        
+        # Trim to actual size
+        content = content[:size]
+        
+        # Try to display as text
+        try:
+            print(content.decode('utf-8', errors='replace'))
+        except Exception:
+            # Fall back to hex dump for binary files
+            print("Binary file, showing hex dump:")
+            for i in range(0, len(content), 16):
+                chunk = content[i:i+16]
+                hex_part = ' '.join(f'{b:02x}' for b in chunk)
+                ascii_part = ''.join(chr(b) if 32 <= b < 127 else '.' for b in chunk)
+                print(f"{i:04x}: {hex_part:<48} {ascii_part}")
+    
+    def print_help(self):
+        """Display available commands and usage information"""
+        print("\nAvailable Commands:")
+        print("  dir           - List contents of current directory")
+        print("  cd <dir>      - Change directory (cd .. to go to parent)")
+        print("  read <file>   - Read and print the contents of a file")
+        print("  pwd           - Print the current working directory")
+        print("  help          - Display this help information")
+        print("  exit          - Exit the program")
+    
+    def run(self):
+        """Main command loop"""
+        print(f"Disk Label: {self.disk_label}")
+        print("Type 'help' for available commands")
+        
+        while True:
+            try:
+                command = input(f"\n{self.get_current_path()}> ").strip()
+                
+                if not command:
+                    continue
+                
+                parts = command.split()
+                cmd = parts[0].lower()
+                
+                if cmd == 'dir':
+                    self.list_directory()
+                elif cmd == 'cd':
+                    if len(parts) < 2:
+                        print("Usage: cd <directory>")
+                    else:
+                        self.change_directory(parts[1])
+                elif cmd == 'read':
+                    if len(parts) < 2:
+                        print("Usage: read <file>")
+                    else:
+                        self.read_file(parts[1])
+                elif cmd == 'pwd':
+                    print(f"Current directory: {self.get_current_path()}")
+                elif cmd == 'help':
+                    self.print_help()
+                elif cmd == 'exit':
+                    break
+                else:
+                    print(f"Unknown command: {cmd}")
+                    print("Type 'help' for available commands")
+            
+            except Exception as e:
+                print(f"Error: {str(e)}")
+        
+        # Print disk statistics when exiting
+        self.disk.printStats()
+
+if __name__ == "__main__":
+    # Check for command line arguments
+    if len(sys.argv) < 2:
+        print("use this command in the ubuntu cmd: python3 filename.py disk.img 512")
+        sys.exit(1)
+    
+    disk_file = sys.argv[1]
+    block_size = int(sys.argv[2]) if len(sys.argv) > 2 else 512
+    
+    try:
+        browser = FilesystemBrowser(disk_file, block_size)
+        browser.run()
+    except Exception as e:
+        print(f"Error initializing file system browser: {str(e)}")
+        sys.exit(1)
